@@ -1,3 +1,21 @@
+/**
+ * NeverForget - Main Application
+ * 
+ * Purpose: Contact tracking application that automatically captures location
+ *          when contacts are added to the device.
+ * 
+ * Author: Bryce Christian
+ * Course: SENG 564
+ * Date: November 16, 2025
+ * 
+ * Clean Code Principles Applied:
+ * - Meaningful names that reveal intent
+ * - Functions do one thing
+ * - Comments explain "why", not "what"
+ * - DRY (Don't Repeat Yourself)
+ * - Error handling with try-catch
+ */
+
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   AppState,
@@ -20,200 +38,374 @@ import * as Contacts from 'expo-contacts';
 import * as Location from 'expo-location';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+/**
+ * AsyncStorage persistence keys
+ * Prefixed with @nf: to avoid collisions with other apps
+ */
+const STORAGE_KEYS = {
+  FIRST_SEEN: '@nf:firstSeen',      // When contact was first seen by app
+  TAGS: '@nf:tags',                 // User-created tags per contact
+  PINS: '@nf:pins',                 // Location pins for contacts
+  READY: '@nf:ready',               // Timestamp when app was initialized
+  IMPORT_CHOICE: '@nf:importChoice' // 'all' | 'newOnly'
+};
+
+/**
+ * Native modules for enhanced contact functionality
+ */
 const { ContactsCreationDateModule, ContactsEventsModule } = NativeModules;
-const contactsEvents = ContactsEventsModule
+
+/**
+ * Event emitter for real-time contact change notifications
+ */
+const contactsEventEmitter = ContactsEventsModule
   ? new NativeEventEmitter(ContactsEventsModule)
   : null;
 
-/* -------- persistent keys ---------- */
-const FIRST_SEEN_KEY      = '@nf:firstSeen';
-const TAGS_KEY            = '@nf:tags';
-const PINS_KEY            = '@nf:pins';
-const READY_KEY           = '@nf:ready';
-const IMPORT_CHOICE_KEY   = '@nf:importChoice';
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
 
-/* -------- helpers ---------- */
-const loadJSON = async (k, fallback) => {
-  try { const v = await AsyncStorage.getItem(k); return v ? JSON.parse(v) : fallback; }
-  catch { return fallback; }
-};
-const saveJSON = (k, obj) => AsyncStorage.setItem(k, JSON.stringify(obj));
-
-const onlyDigits = (s='') => (s.match(/\d+/g) || []).join('');
-const fmtAbs = (ms) => {
+/**
+ * Loads and parses JSON data from AsyncStorage
+ * 
+ * @param {string} key - Storage key
+ * @param {*} fallbackValue - Default value if key doesn't exist
+ * @returns {Promise<*>} Parsed data or fallback
+ */
+const loadJSON = async (key, fallbackValue) => {
   try {
-    const d = new Date(ms);
-    return d.toLocaleString();
-  } catch { return ''; }
+    const value = await AsyncStorage.getItem(key);
+    return value ? JSON.parse(value) : fallbackValue;
+  } catch (error) {
+    console.error(`Failed to load ${key}:`, error);
+    return fallbackValue;
+  }
 };
-const openPinInMaps = ({ latitude, longitude }, name='Location') => {
-  const label = encodeURIComponent(name);
-  const lat = latitude, lng = longitude;
+
+/**
+ * Saves data to AsyncStorage as JSON
+ * 
+ * @param {string} key - Storage key
+ * @param {*} data - Data to serialize and save
+ */
+const saveJSON = (key, data) => {
+  AsyncStorage.setItem(key, JSON.stringify(data));
+};
+
+/**
+ * Extracts only digits from a phone number string
+ * 
+ * Why: Phone numbers can have various formats (+1-303-555-1212)
+ *      but we need consistent comparison (13035551212)
+ * 
+ * @param {string} phoneNumber - Formatted phone number
+ * @returns {string} Digits only
+ */
+const extractDigitsOnly = (phoneNumber = '') => {
+  return (phoneNumber.match(/\d+/g) || []).join('');
+};
+
+/**
+ * Formats epoch timestamp as localized datetime string
+ * 
+ * @param {number} milliseconds - Epoch timestamp
+ * @returns {string} Formatted date/time or empty string on error
+ */
+const formatAbsoluteTime = (milliseconds) => {
+  try {
+    return new Date(milliseconds).toLocaleString();
+  } catch {
+    return '';
+  }
+};
+
+/**
+ * Opens device's native maps app with coordinates
+ * 
+ * @param {Object} location - Location object with latitude/longitude
+ * @param {string} label - Label for the map pin
+ */
+const openLocationInNativeMaps = ({ latitude, longitude }, label = 'Location') => {
+  const encodedLabel = encodeURIComponent(label);
   const url = Platform.select({
-    ios:  `http://maps.apple.com/?ll=${lat},${lng}&q=${label}`,
-    android: `geo:${lat},${lng}?q=${lat},${lng}(${label})`,
+    ios: `http://maps.apple.com/?ll=${latitude},${longitude}&q=${encodedLabel}`,
+    android: `geo:${latitude},${longitude}?q=${latitude},${longitude}(${encodedLabel})`,
   });
   Linking.openURL(url);
 };
 
-/* -------- native "created" map (phone -> epoch) ---------- */
-async function loadNativeCreated() {
+/**
+ * Fetches contact creation dates from native AddressBook
+ * 
+ * Why: CNContacts API doesn't expose creation dates, but deprecated
+ *      AddressBook still works and provides this metadata
+ * 
+ * @returns {Promise<Object>} Map of phone number (digits) to creation timestamp
+ */
+async function loadNativeContactCreationDates() {
   try {
-    if (!ContactsCreationDateModule?.getPhoneDates) return {};
-    const rows = await ContactsCreationDateModule.getPhoneDates();
-    const map = {};
-    for (const r of rows || []) {
-      const t = Date.parse(r.creationDate);
-      const phone = onlyDigits(r.phone);
-      if (phone && Number.isFinite(t)) map[phone] = t;
+    if (!ContactsCreationDateModule?.getPhoneDates) {
+      return {};
     }
-    return map;
-  } catch {
+    
+    const rows = await ContactsCreationDateModule.getPhoneDates();
+    const phoneToTimestampMap = {};
+    
+    for (const row of rows || []) {
+      const timestamp = Date.parse(row.creationDate);
+      const digitsOnly = extractDigitsOnly(row.phone);
+      
+      if (digitsOnly && Number.isFinite(timestamp)) {
+        phoneToTimestampMap[digitsOnly] = timestamp;
+      }
+    }
+    
+    return phoneToTimestampMap;
+  } catch (error) {
+    console.error('Failed to load native creation dates:', error);
     return {};
   }
 }
 
+// ============================================================================
+// MAIN COMPONENT
+// ============================================================================
+
+/**
+ * NeverForget Application
+ * 
+ * Responsibilities:
+ * - Manage contact permissions
+ * - Track when contacts are added
+ * - Capture location at contact creation time
+ * - Display contacts in list and map views
+ * - Support tagging and filtering
+ */
 export default function App() {
-  /* ---------- state ---------- */
-  const [perm, setPerm]                     = useState('undetermined');
-  const [contacts, setContacts]             = useState([]);
-  const [createdMap, setCreatedMap]         = useState({});
-  const [firstSeen, setFirstSeen]           = useState({});
-  const [tagsById, setTagsById]             = useState({});
-  const [pinsById, setPinsById]             = useState({});
-  const [loading, setLoading]               = useState(false);
-  const [refreshing, setRefreshing]         = useState(false);
-
-  const [search, setSearch]                 = useState('');
-  const [view, setView]                     = useState('list'); // 'list' | 'map'
-
+  // --------------------------------------------------------------------------
+  // STATE
+  // --------------------------------------------------------------------------
+  
+  const [contactPermission, setContactPermission] = useState('undetermined');
+  const [contacts, setContacts] = useState([]);
+  const [nativeCreationDates, setNativeCreationDates] = useState({});
+  const [firstSeenTimestamps, setFirstSeenTimestamps] = useState({});
+  const [tagsByContactId, setTagsByContactId] = useState({});
+  const [locationPinsByContactId, setLocationPinsByContactId] = useState({});
+  const [isLoadingContacts, setIsLoadingContacts] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  
+  const [searchQuery, setSearchQuery] = useState('');
+  const [currentView, setCurrentView] = useState('list'); // 'list' | 'map'
+  
   const [showImportModal, setShowImportModal] = useState(false);
-  const [importChoice, setImportChoice]       = useState(null);
+  const [importMode, setImportMode] = useState(null); // 'all' | 'newOnly'
+  
+  const [contactBeingTagged, setContactBeingTagged] = useState(null);
+  const [tagInputText, setTagInputText] = useState('');
 
-  const [editingTagFor, setEditingTagFor]   = useState(null);
-  const [tagText, setTagText]               = useState('');
-
-  /* ---------- tag helpers ---------- */
-  const addTag = useCallback(async (id, txt) => {
-    const t = (txt || '').trim();
-    if (!t) return;
-    setTagsById(prev => {
-      const next = { ...prev, [id]: Array.from(new Set([...(prev[id]||[]), t])) };
-      saveJSON(TAGS_KEY, next);
-      return next;
+  // --------------------------------------------------------------------------
+  // TAG MANAGEMENT
+  // --------------------------------------------------------------------------
+  
+  /**
+   * Adds a tag to a contact
+   * 
+   * @param {string} contactId - Unique contact identifier
+   * @param {string} tagText - Tag to add
+   */
+  const addTagToContact = useCallback(async (contactId, tagText) => {
+    const trimmedTag = (tagText || '').trim();
+    if (!trimmedTag) return;
+    
+    setTagsByContactId(previousTags => {
+      const existingTags = previousTags[contactId] || [];
+      const updatedTags = Array.from(new Set([...existingTags, trimmedTag]));
+      const newTagState = { ...previousTags, [contactId]: updatedTags };
+      
+      saveJSON(STORAGE_KEYS.TAGS, newTagState);
+      return newTagState;
     });
   }, []);
 
-  const removeTag = useCallback(async (id, t) => {
-    setTagsById(prev => {
-      const next = { ...prev, [id]: (prev[id]||[]).filter(x => x !== t) };
-      saveJSON(TAGS_KEY, next);
-      return next;
+  /**
+   * Removes a tag from a contact
+   * 
+   * @param {string} contactId - Unique contact identifier
+   * @param {string} tagToRemove - Tag to remove
+   */
+  const removeTagFromContact = useCallback(async (contactId, tagToRemove) => {
+    setTagsByContactId(previousTags => {
+      const filteredTags = (previousTags[contactId] || []).filter(
+        tag => tag !== tagToRemove
+      );
+      const newTagState = { ...previousTags, [contactId]: filteredTags };
+      
+      saveJSON(STORAGE_KEYS.TAGS, newTagState);
+      return newTagState;
     });
   }, []);
 
-  /* ---------- created-time resolution ---------- */
-  const getCreatedTime = useCallback((c) => {
-    const num = onlyDigits(c?.phoneNumbers?.[0]?.number);
-    if (num && createdMap[num]) return createdMap[num];
-    if (firstSeen[c.id]) return firstSeen[c.id];
-    return 0;
-  }, [createdMap, firstSeen]);
+  // --------------------------------------------------------------------------
+  // CONTACT TIMESTAMP RESOLUTION
+  // --------------------------------------------------------------------------
+  
+  /**
+   * Determines when a contact was created
+   * 
+   * Priority:
+   * 1. Native creation date from AddressBook (most accurate)
+   * 2. First seen timestamp (when app first saw this contact)
+   * 3. 0 (unknown/not tracked)
+   * 
+   * @param {Object} contact - Contact object from Expo Contacts
+   * @returns {number} Creation timestamp or 0
+   */
+  const getContactCreationTime = useCallback((contact) => {
+    // Try to get native creation date via phone number
+    const phoneDigits = extractDigitsOnly(contact?.phoneNumbers?.[0]?.number);
+    if (phoneDigits && nativeCreationDates[phoneDigits]) {
+      return nativeCreationDates[phoneDigits];
+    }
+    
+    // Fall back to first seen timestamp
+    if (firstSeenTimestamps[contact.id]) {
+      return firstSeenTimestamps[contact.id];
+    }
+    
+    return 0; // Unknown
+  }, [nativeCreationDates, firstSeenTimestamps]);
 
-  /* ---------- fetch contacts ---------- */
-  const fetchContacts = useCallback(async (isRefresh = false) => {
-    if (!isRefresh) setLoading(true);
-    setRefreshing(isRefresh);
+  // --------------------------------------------------------------------------
+  // CONTACT FETCHING
+  // --------------------------------------------------------------------------
+  
+  /**
+   * Fetches contacts from device and applies import mode filtering
+   * 
+   * This function:
+   * - Requests contacts permission if needed
+   * - Loads all device contacts
+   * - Loads persisted metadata (tags, pins, timestamps)
+   * - Applies import mode logic (all vs. newOnly)
+   * - Updates state
+   * 
+   * @param {boolean} isRefreshAction - True if user manually refreshed
+   */
+  const fetchContactsFromDevice = useCallback(async (isRefreshAction = false) => {
+    if (!isRefreshAction) setIsLoadingContacts(true);
+    setIsRefreshing(isRefreshAction);
 
     try {
-      const permState = await Contacts.getPermissionsAsync();
-      let status = permState.status;
-      let granted = status === 'granted';
-      if (!granted && (status === 'undetermined' || permState.canAskAgain)) {
-        const req = await Contacts.requestPermissionsAsync();
-        status = req.status;
-        granted = status === 'granted';
+      // Request contacts permission
+      const permissionState = await Contacts.getPermissionsAsync();
+      let permissionStatus = permissionState.status;
+      let isGranted = permissionStatus === 'granted';
+      
+      if (!isGranted && (permissionStatus === 'undetermined' || permissionState.canAskAgain)) {
+        const requestResult = await Contacts.requestPermissionsAsync();
+        permissionStatus = requestResult.status;
+        isGranted = permissionStatus === 'granted';
       }
-      setPerm(status);
-      if (!granted) return;
+      
+      setContactPermission(permissionStatus);
+      if (!isGranted) return;
 
-      const [result, nativeCreated, fs, tags, pins] = await Promise.all([
+      // Fetch all data in parallel for performance
+      const [
+        contactsResult,
+        nativeDates,
+        firstSeenMap,
+        tagsMap,
+        pinsMap
+      ] = await Promise.all([
         Contacts.getContactsAsync({ fields: [Contacts.Fields.PhoneNumbers] }),
-        loadNativeCreated(),
-        loadJSON(FIRST_SEEN_KEY, {}),
-        loadJSON(TAGS_KEY, {}),
-        loadJSON(PINS_KEY, {}),
+        loadNativeContactCreationDates(),
+        loadJSON(STORAGE_KEYS.FIRST_SEEN, {}),
+        loadJSON(STORAGE_KEYS.TAGS, {}),
+        loadJSON(STORAGE_KEYS.PINS, {}),
       ]);
 
-      setCreatedMap(nativeCreated);
-      setTagsById(tags);
-      setPinsById(pins);
+      setNativeCreationDates(nativeDates);
+      setTagsByContactId(tagsMap);
+      setLocationPinsByContactId(pinsMap);
 
-      let fsMap = { ...fs };
-      const ready = await AsyncStorage.getItem(READY_KEY);
+      let firstSeenWorkingCopy = { ...firstSeenMap };
+      const readyTimestamp = await AsyncStorage.getItem(STORAGE_KEYS.READY);
 
-      if (importChoice === 'all') {
+      // Apply import mode logic
+      if (importMode === 'all') {
+        // Import all contacts: timestamp any new ones, show all
         const now = Date.now();
-        const newIds = [];
-        for (const c of result.data) {
-          if (!fsMap[c.id]) {
-            fsMap[c.id] = now;
-            newIds.push(c.id);
+        const newContactIds = [];
+        
+        for (const contact of contactsResult.data) {
+          if (!firstSeenWorkingCopy[contact.id]) {
+            firstSeenWorkingCopy[contact.id] = now;
+            newContactIds.push(contact.id);
           }
         }
-        if (!ready) await AsyncStorage.setItem(READY_KEY, '1');
-        if (newIds.length) await saveJSON(FIRST_SEEN_KEY, fsMap);
-        setFirstSeen(fsMap);
-        setContacts(result.data);
-      } else if (importChoice === 'newOnly') {
-        const readyTimestamp = await AsyncStorage.getItem(READY_KEY);
-        
-        console.log('=== newOnly mode ===');
-        console.log('readyTimestamp:', readyTimestamp);
-        console.log('Total contacts from device:', result.data.length);
         
         if (!readyTimestamp) {
-          // First time - mark all existing as seen but don't show them
+          await AsyncStorage.setItem(STORAGE_KEYS.READY, '1');
+        }
+        if (newContactIds.length) {
+          await saveJSON(STORAGE_KEYS.FIRST_SEEN, firstSeenWorkingCopy);
+        }
+        
+        setFirstSeenTimestamps(firstSeenWorkingCopy);
+        setContacts(contactsResult.data);
+        
+      } else if (importMode === 'newOnly') {
+        // Only new contacts: mark existing as seen, filter to show only new
+        
+        if (!readyTimestamp) {
+          // First run: mark all existing contacts with cutoff time
           const cutoffTime = Date.now();
           console.log('First run - setting cutoff time:', cutoffTime);
           
-          for (const c of result.data) {
-            fsMap[c.id] = cutoffTime; // Mark ALL existing contacts with cutoff time
+          for (const contact of contactsResult.data) {
+            firstSeenWorkingCopy[contact.id] = cutoffTime;
           }
           
-          await AsyncStorage.setItem(READY_KEY, cutoffTime.toString());
-          await saveJSON(FIRST_SEEN_KEY, fsMap);
-          setFirstSeen(fsMap);
+          await AsyncStorage.setItem(STORAGE_KEYS.READY, cutoffTime.toString());
+          await saveJSON(STORAGE_KEYS.FIRST_SEEN, firstSeenWorkingCopy);
+          setFirstSeenTimestamps(firstSeenWorkingCopy);
           setContacts([]); // Show empty list initially
           console.log('Set contacts to empty array');
+          
         } else {
-          // Subsequent fetches - only show contacts added AFTER cutoff
+          // Subsequent runs: only show contacts added AFTER cutoff
           const cutoffTime = parseInt(readyTimestamp);
           console.log('Using cutoff time:', cutoffTime, new Date(cutoffTime));
           const now = Date.now();
-          let newContactIds = [];
+          const newContactIds = [];
           
-          for (const c of result.data) {
-            if (!fsMap[c.id]) {
-              // This is a NEW contact (not in our firstSeen map)
-              fsMap[c.id] = now;
-              newContactIds.push(c.id);
+          for (const contact of contactsResult.data) {
+            if (!firstSeenWorkingCopy[contact.id]) {
+              firstSeenWorkingCopy[contact.id] = now;
+              newContactIds.push(contact.id);
             }
           }
           
           if (newContactIds.length > 0) {
             console.log('Found new contacts:', newContactIds.length);
-            await saveJSON(FIRST_SEEN_KEY, fsMap);
+            await saveJSON(STORAGE_KEYS.FIRST_SEEN, firstSeenWorkingCopy);
           }
           
-          setFirstSeen(fsMap);
+          setFirstSeenTimestamps(firstSeenWorkingCopy);
           
-          // Only show contacts that were first seen AFTER the cutoff
-          const filteredContacts = result.data.filter(c => {
-            const seenTime = fsMap[c.id];
+          // Filter to only contacts seen AFTER cutoff
+          const filteredContacts = contactsResult.data.filter(contact => {
+            const seenTime = firstSeenWorkingCopy[contact.id];
             const shouldShow = seenTime && seenTime > cutoffTime;
             if (shouldShow) {
-              console.log('Showing contact:', c.name, 'seen at:', new Date(seenTime));
+              console.log('Showing contact:', contact.name, 'seen at:', new Date(seenTime));
             }
             return shouldShow;
           });
@@ -222,177 +414,255 @@ export default function App() {
           setContacts(filteredContacts);
         }
       } else {
-        setFirstSeen(fsMap);
-        setContacts(result.data);
+        // No import mode selected yet
+        setFirstSeenTimestamps(firstSeenWorkingCopy);
+        setContacts(contactsResult.data);
       }
+      
     } catch (error) {
       console.error('fetchContacts error:', error);
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      setIsLoadingContacts(false);
+      setIsRefreshing(false);
     }
-  }, [importChoice]);
+  }, [importMode]);
 
-  /* ---------- bootstrap ---------- */
+  // --------------------------------------------------------------------------
+  // APP INITIALIZATION
+  // --------------------------------------------------------------------------
+  
+  /**
+   * Bootstrap application on launch
+   * 
+   * This effect:
+   * - Requests contacts permission
+   * - Requests location permission upfront (no surprise prompts later)
+   * - Loads import preference
+   * - Shows import modal if first run
+   * - Sets up app state change listener for re-activation
+   */
   useEffect(() => {
-    const run = async () => {
+    const initializeApp = async () => {
       // Request contacts permission
-      const p = await Contacts.getPermissionsAsync();
-      let status = p.status;
-      if (status !== 'granted' && (status === 'undetermined' || p.canAskAgain)) {
-        const r = await Contacts.requestPermissionsAsync();
-        status = r.status;
+      const permissionState = await Contacts.getPermissionsAsync();
+      let permissionStatus = permissionState.status;
+      
+      if (permissionStatus !== 'granted' && 
+          (permissionStatus === 'undetermined' || permissionState.canAskAgain)) {
+        const requestResult = await Contacts.requestPermissionsAsync();
+        permissionStatus = requestResult.status;
       }
-      setPerm(status);
+      
+      setContactPermission(permissionStatus);
 
-      if (status !== 'granted') {
+      if (permissionStatus !== 'granted') {
         setShowImportModal(false);
         return;
       }
 
-      // Request location permission upfront
-      const locPerm = await Location.getForegroundPermissionsAsync();
-      if (locPerm.status !== 'granted' && locPerm.canAskAgain) {
+      // Request location permission upfront (better UX than surprise prompt)
+      const locationPermission = await Location.getForegroundPermissionsAsync();
+      if (locationPermission.status !== 'granted' && locationPermission.canAskAgain) {
         await Location.requestForegroundPermissionsAsync();
       }
 
-      const choice = await AsyncStorage.getItem(IMPORT_CHOICE_KEY);
-      setImportChoice(choice);
+      // Check if user has chosen import preference
+      const savedImportChoice = await AsyncStorage.getItem(STORAGE_KEYS.IMPORT_CHOICE);
+      setImportMode(savedImportChoice);
       
-      // Show import modal AFTER permission is granted and if no choice exists
-      if (!choice) {
+      if (!savedImportChoice) {
         setShowImportModal(true);
       } else {
-        await fetchContacts(false);
+        await fetchContactsFromDevice(false);
       }
     };
 
-    run();
-    const sub = AppState.addEventListener('change', s => {
-      if (s === 'active') run();
+    initializeApp();
+    
+    // Re-initialize when app comes to foreground
+    const appStateSubscription = AppState.addEventListener('change', state => {
+      if (state === 'active') {
+        initializeApp();
+      }
     });
-    return () => sub.remove();
-  }, [fetchContacts]);
+    
+    return () => appStateSubscription.remove();
+  }, [fetchContactsFromDevice]);
 
-  /* ---------- Contact change detection - auto-add with location ---------- */
+  // --------------------------------------------------------------------------
+  // CONTACT CHANGE DETECTION
+  // --------------------------------------------------------------------------
+  
+  /**
+   * Listens for contact additions and automatically captures location
+   * 
+   * This effect:
+   * - Subscribes to ContactsChanged event from native module
+   * - Detects new contacts by comparing IDs
+   * - Automatically gets current location
+   * - Saves location pin for new contacts
+   * - Refreshes contact list
+   * 
+   * Why automatic: Better UX than prompting user every time
+   */
   useEffect(() => {
-    if (!contactsEvents) return;
+    if (!contactsEventEmitter) return;
 
-    const sub = contactsEvents.addListener('ContactsChanged', async () => {
-      const current = await Contacts.getContactsAsync({
+    const subscription = contactsEventEmitter.addListener('ContactsChanged', async () => {
+      const currentContactsResult = await Contacts.getContactsAsync({
         fields: [Contacts.Fields.PhoneNumbers]
       });
 
-      const currentIds = new Set(current.data.map(c => c.id));
-      const prevIds = new Set(contacts.map(c => c.id));
-      const newIds = [...currentIds].filter(id => !prevIds.has(id));
+      const currentContactIds = new Set(currentContactsResult.data.map(c => c.id));
+      const previousContactIds = new Set(contacts.map(c => c.id));
+      const newContactIds = [...currentContactIds].filter(id => !previousContactIds.has(id));
 
-      if (newIds.length > 0) {
-        // Automatically get location and add contacts - no alert
+      if (newContactIds.length > 0) {
+        // Automatically capture location for new contacts
         try {
           const { status } = await Location.getForegroundPermissionsAsync();
           
           if (status === 'granted') {
-            const pos = await Location.getCurrentPositionAsync({
+            const position = await Location.getCurrentPositionAsync({
               accuracy: Location.Accuracy.Balanced
             });
 
-            const { latitude, longitude } = pos.coords;
+            const { latitude, longitude } = position.coords;
             const timestamp = Date.now();
 
-            setPinsById(prev => {
-              const next = { ...prev };
-              for (const id of newIds) {
-                next[id] = { latitude, longitude, timestamp };
+            // Save location pins
+            setLocationPinsByContactId(previousPins => {
+              const updatedPins = { ...previousPins };
+              for (const contactId of newContactIds) {
+                updatedPins[contactId] = { latitude, longitude, timestamp };
               }
-              saveJSON(PINS_KEY, next);
-              return next;
+              saveJSON(STORAGE_KEYS.PINS, updatedPins);
+              return updatedPins;
             });
 
-            setFirstSeen(prev => {
-              const next = { ...prev };
-              for (const id of newIds) {
-                if (!next[id]) next[id] = timestamp;
+            // Update first seen timestamps
+            setFirstSeenTimestamps(previousTimestamps => {
+              const updatedTimestamps = { ...previousTimestamps };
+              for (const contactId of newContactIds) {
+                if (!updatedTimestamps[contactId]) {
+                  updatedTimestamps[contactId] = timestamp;
+                }
               }
-              saveJSON(FIRST_SEEN_KEY, next);
-              return next;
+              saveJSON(STORAGE_KEYS.FIRST_SEEN, updatedTimestamps);
+              return updatedTimestamps;
             });
           }
         } catch (error) {
-          console.error('Location error:', error);
+          console.error('Location capture error:', error);
         }
         
-        // Refresh contacts list
-        fetchContacts(true);
+        // Refresh contact list
+        fetchContactsFromDevice(true);
       }
     });
 
-    return () => sub.remove();
-  }, [contacts, fetchContacts]);
+    return () => subscription.remove();
+  }, [contacts, fetchContactsFromDevice]);
 
-  /* ---------- Handle native module events (location from Swift) ---------- */
+  /**
+   * Handles location events from native module
+   * 
+   * Why separate from ContactsChanged: Native module can also emit
+   * location events with contact ID when using native add contact UI
+   */
   useEffect(() => {
-    if (!contactsEvents) return;
+    if (!contactsEventEmitter) return;
 
-    const sub = contactsEvents.addListener(
+    const subscription = contactsEventEmitter.addListener(
       'ContactAddedWithLocation',
       async (payload) => {
         console.log('ContactAddedWithLocation event received:', payload);
         const { id, lat, lng, timestamp } = payload || {};
-        const ts = Number.isFinite(timestamp) ? timestamp : Date.now();
+        const finalTimestamp = Number.isFinite(timestamp) ? timestamp : Date.now();
 
-        setFirstSeen(prev => {
-          const next = { ...prev, [id]: ts };
-          saveJSON(FIRST_SEEN_KEY, next);
-          return next;
+        setFirstSeenTimestamps(previous => {
+          const updated = { ...previous, [id]: finalTimestamp };
+          saveJSON(STORAGE_KEYS.FIRST_SEEN, updated);
+          return updated;
         });
 
-        setPinsById(prev => {
-          const next = { ...prev, [id]: { latitude: lat, longitude: lng, timestamp: ts } };
+        setLocationPinsByContactId(previous => {
+          const updated = { 
+            ...previous, 
+            [id]: { latitude: lat, longitude: lng, timestamp: finalTimestamp } 
+          };
           console.log('Saving pin for contact:', id, { latitude: lat, longitude: lng });
-          saveJSON(PINS_KEY, next);
-          return next;
+          saveJSON(STORAGE_KEYS.PINS, updated);
+          return updated;
         });
 
-        await fetchContacts(true);
+        await fetchContactsFromDevice(true);
       }
     );
 
-    return () => sub.remove();
-  }, [fetchContacts]);
+    return () => subscription.remove();
+  }, [fetchContactsFromDevice]);
 
-  /* ---------- UI data - SORTED BY DATE ---------- */
-  const data = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    const base = q
-      ? contacts.filter(c => {
-          const nameHit = (c.name || '').toLowerCase().includes(q);
-          const tagHit = (tagsById[c.id] || []).some(t => t.toLowerCase().includes(q));
-          return nameHit || tagHit;
+  // --------------------------------------------------------------------------
+  // DATA TRANSFORMATIONS
+  // --------------------------------------------------------------------------
+  
+  /**
+   * Filters and sorts contacts for display
+   * 
+   * Sorting priority:
+   * 1. Contacts with timestamps (newest first)
+   * 2. Contacts without timestamps (alphabetical)
+   */
+  const displayedContacts = useMemo(() => {
+    const queryLowercase = searchQuery.trim().toLowerCase();
+    
+    const filteredContacts = queryLowercase
+      ? contacts.filter(contact => {
+          const nameMatch = (contact.name || '').toLowerCase().includes(queryLowercase);
+          const tagMatch = (tagsByContactId[contact.id] || []).some(
+            tag => tag.toLowerCase().includes(queryLowercase)
+          );
+          return nameMatch || tagMatch;
         })
       : contacts.slice();
 
-    // Always sort by created date (most recent first)
-    base.sort((a, b) => {
-      const ta = getCreatedTime(a), tb = getCreatedTime(b);
-      const ha = ta > 0, hb = tb > 0;
-      if (ha && hb) return tb - ta; // Both have times: newer first
-      if (ha && !hb) return -1;     // Only a has time: a first
-      if (!ha && hb) return 1;      // Only b has time: b first
-      return (a.name || '').localeCompare(b.name || ''); // Neither: alphabetical
+    // Sort by creation time (most recent first)
+    filteredContacts.sort((contactA, contactB) => {
+      const timeA = getContactCreationTime(contactA);
+      const timeB = getContactCreationTime(contactB);
+      const hasTimeA = timeA > 0;
+      const hasTimeB = timeB > 0;
+      
+      if (hasTimeA && hasTimeB) return timeB - timeA; // Both have times: newer first
+      if (hasTimeA && !hasTimeB) return -1;           // Only A has time: A first
+      if (!hasTimeA && hasTimeB) return 1;            // Only B has time: B first
+      
+      // Neither has time: alphabetical
+      return (contactA.name || '').localeCompare(contactB.name || '');
     });
 
-    return base;
-  }, [contacts, search, tagsById, getCreatedTime]);
+    return filteredContacts;
+  }, [contacts, searchQuery, tagsByContactId, getContactCreationTime]);
 
-  // Contacts with pins for map view
-  const contactsWithPins = useMemo(() => {
-    return data.filter(c => pinsById[c.id]);
-  }, [data, pinsById]);
+  /**
+   * Filters contacts to only those with location pins
+   */
+  const contactsWithLocationPins = useMemo(() => {
+    return displayedContacts.filter(contact => locationPinsByContactId[contact.id]);
+  }, [displayedContacts, locationPinsByContactId]);
 
-  // Calculate map region
-  const mapRegion = useMemo(() => {
-    if (contactsWithPins.length === 0) {
+  /**
+   * Calculates map region to fit all pins
+   * 
+   * Algorithm:
+   * 1. Find min/max latitude and longitude
+   * 2. Center on midpoint
+   * 3. Set delta to encompass all pins with 1.5x padding
+   */
+  const calculatedMapRegion = useMemo(() => {
+    if (contactsWithLocationPins.length === 0) {
+      // Default to Denver, CO area if no pins
       return {
         latitude: 39.7392,
         longitude: -104.9903,
@@ -401,86 +671,107 @@ export default function App() {
       };
     }
 
-    const lats = contactsWithPins.map(c => pinsById[c.id].latitude);
-    const lngs = contactsWithPins.map(c => pinsById[c.id].longitude);
+    const latitudes = contactsWithLocationPins.map(c => locationPinsByContactId[c.id].latitude);
+    const longitudes = contactsWithLocationPins.map(c => locationPinsByContactId[c.id].longitude);
 
-    const minLat = Math.min(...lats);
-    const maxLat = Math.max(...lats);
-    const minLng = Math.min(...lngs);
-    const maxLng = Math.max(...lngs);
+    const minLatitude = Math.min(...latitudes);
+    const maxLatitude = Math.max(...latitudes);
+    const minLongitude = Math.min(...longitudes);
+    const maxLongitude = Math.max(...longitudes);
 
     return {
-      latitude: (minLat + maxLat) / 2,
-      longitude: (minLng + maxLng) / 2,
-      latitudeDelta: Math.max(maxLat - minLat, 0.05) * 1.5,
-      longitudeDelta: Math.max(maxLng - minLng, 0.05) * 1.5,
+      latitude: (minLatitude + maxLatitude) / 2,
+      longitude: (minLongitude + maxLongitude) / 2,
+      latitudeDelta: Math.max(maxLatitude - minLatitude, 0.05) * 1.5,
+      longitudeDelta: Math.max(maxLongitude - minLongitude, 0.05) * 1.5,
     };
-  }, [contactsWithPins, pinsById]);
+  }, [contactsWithLocationPins, locationPinsByContactId]);
 
-  /* ---------- render ---------- */
-  if (perm !== 'granted') {
+  // --------------------------------------------------------------------------
+  // RENDER: PERMISSION GATE
+  // --------------------------------------------------------------------------
+  
+  if (contactPermission !== 'granted') {
     return (
       <SafeAreaView style={styles.center}>
-        <Text style={styles.title}>Recently</Text>
+        <Text style={styles.title}>NeverForget</Text>
         <Text style={{ textAlign: 'center', marginTop: 8 }}>
-          NeverForget needs access to Contacts.
+          This app needs access to your contacts to function.
         </Text>
-        <TouchableOpacity style={styles.cta} onPress={() => Linking.openSettings()}>
-          <Text style={styles.ctaText}>Open Settings</Text>
+        <TouchableOpacity 
+          style={styles.callToAction} 
+          onPress={() => Linking.openSettings()}
+        >
+          <Text style={styles.callToActionText}>Open Settings</Text>
         </TouchableOpacity>
       </SafeAreaView>
     );
   }
 
+  // --------------------------------------------------------------------------
+  // RENDER: MAIN UI
+  // --------------------------------------------------------------------------
+  
   return (
     <SafeAreaView style={styles.container}>
-      <Text style={styles.title}>Recently</Text>
+      <Text style={styles.title}>NeverForget</Text>
 
+      {/* Search Bar */}
       <TextInput
-        value={search}
-        onChangeText={setSearch}
+        value={searchQuery}
+        onChangeText={setSearchQuery}
         placeholder="Search name or tag…"
         autoCapitalize="none"
-        style={styles.search}
+        style={styles.searchInput}
       />
 
-      <View style={styles.tabs}>
+      {/* View Tabs */}
+      <View style={styles.tabBar}>
         <TouchableOpacity
-          onPress={() => setView('list')}
-          style={[styles.tab, view === 'list' && styles.tabActive]}
+          onPress={() => setCurrentView('list')}
+          style={[styles.tab, currentView === 'list' && styles.tabActive]}
         >
-          <Text style={[styles.tabText, view === 'list' && styles.tabTextActive]}>Created</Text>
+          <Text style={[styles.tabText, currentView === 'list' && styles.tabTextActive]}>
+            Created
+          </Text>
         </TouchableOpacity>
         <TouchableOpacity
-          onPress={() => setView('map')}
-          style={[styles.tab, view === 'map' && styles.tabActive]}
+          onPress={() => setCurrentView('map')}
+          style={[styles.tab, currentView === 'map' && styles.tabActive]}
         >
-          <Text style={[styles.tabText, view === 'map' && styles.tabTextActive]}>Map</Text>
+          <Text style={[styles.tabText, currentView === 'map' && styles.tabTextActive]}>
+            Map
+          </Text>
         </TouchableOpacity>
       </View>
 
-      {loading ? (
-        <View style={styles.loading}>
+      {/* Loading Indicator */}
+      {isLoadingContacts ? (
+        <View style={styles.loadingContainer}>
           <ActivityIndicator />
           <Text style={{ marginTop: 6 }}>Loading contacts…</Text>
         </View>
-      ) : view === 'map' ? (
+        
+      ) : currentView === 'map' ? (
+        // Map View
         <View style={styles.mapContainer}>
-          {contactsWithPins.length === 0 ? (
-            <View style={styles.emptyMap}>
-              <Text style={styles.empty}>No contacts with location data</Text>
-              <Text style={styles.emptyHint}>Add a contact and save its location to see it here</Text>
+          {contactsWithLocationPins.length === 0 ? (
+            <View style={styles.emptyMapState}>
+              <Text style={styles.emptyText}>No contacts with location data</Text>
+              <Text style={styles.emptyHint}>
+                Add a contact to see where you met them
+              </Text>
             </View>
           ) : (
             <MapView
               style={styles.map}
-              initialRegion={mapRegion}
+              initialRegion={calculatedMapRegion}
               showsUserLocation
               showsMyLocationButton
             >
-              {contactsWithPins.map((contact) => {
-                const pin = pinsById[contact.id];
-                const tags = tagsById[contact.id] || [];
+              {contactsWithLocationPins.map((contact) => {
+                const pin = locationPinsByContactId[contact.id];
+                const tags = tagsByContactId[contact.id] || [];
                 const tagText = tags.length > 0 ? ` • ${tags.join(', ')}` : '';
                 
                 return (
@@ -492,90 +783,104 @@ export default function App() {
                     }}
                     title={contact.name || '(No name)'}
                     description={`${contact.phoneNumbers?.[0]?.number || ''}${tagText}`}
-                    onCalloutPress={() => openPinInMaps(pin, contact.name || 'Contact')}
+                    onCalloutPress={() => openLocationInNativeMaps(pin, contact.name || 'Contact')}
                   />
                 );
               })}
             </MapView>
           )}
         </View>
+        
       ) : (
+        // List View
         <FlatList
-          data={data}
+          data={displayedContacts}
           keyExtractor={(item) => item.id}
           refreshControl={
-            <RefreshControl refreshing={refreshing} onRefresh={() => fetchContacts(true)} />
+            <RefreshControl 
+              refreshing={isRefreshing} 
+              onRefresh={() => fetchContactsFromDevice(true)} 
+            />
           }
-          ItemSeparatorComponent={() => <View style={styles.sep} />}
-          ListEmptyComponent={<Text style={styles.empty}>No contacts</Text>}
-          renderItem={({ item }) => {
-            const when = getCreatedTime(item);
-            const tags = tagsById[item.id] || [];
-            const pin = pinsById[item.id];
+          ItemSeparatorComponent={() => <View style={styles.separator} />}
+          ListEmptyComponent={<Text style={styles.emptyText}>No contacts</Text>}
+          renderItem={({ item: contact }) => {
+            const creationTime = getContactCreationTime(contact);
+            const tags = tagsByContactId[contact.id] || [];
+            const locationPin = locationPinsByContactId[contact.id];
 
             return (
-              <View style={styles.row}>
+              <View style={styles.contactRow}>
                 <View style={{ flex: 1 }}>
-                  <Text style={styles.name}>{item.name || '(No name)'}</Text>
-                  {!!item.phoneNumbers?.length && (
-                    <Text style={styles.sub}>{item.phoneNumbers[0]?.number}</Text>
+                  <Text style={styles.contactName}>
+                    {contact.name || '(No name)'}
+                  </Text>
+                  
+                  {!!contact.phoneNumbers?.length && (
+                    <Text style={styles.contactSubtext}>
+                      {contact.phoneNumbers[0]?.number}
+                    </Text>
                   )}
 
+                  {/* Tags Row */}
                   <View style={styles.tagsRow}>
-                    {tags.map((t) => (
+                    {tags.map((tag) => (
                       <TouchableOpacity
-                        key={t}
-                        onLongPress={() => removeTag(item.id, t)}
+                        key={tag}
+                        onLongPress={() => removeTagFromContact(contact.id, tag)}
                         style={styles.tagChip}
                       >
-                        <Text style={styles.tagText}>{t}</Text>
+                        <Text style={styles.tagText}>{tag}</Text>
                       </TouchableOpacity>
                     ))}
-                    {editingTagFor === item.id ? (
+                    
+                    {/* Tag Editor */}
+                    {contactBeingTagged === contact.id ? (
                       <View style={styles.tagEditor}>
                         <TextInput
                           style={styles.tagInput}
                           placeholder="Add tag"
-                          value={tagText}
-                          onChangeText={setTagText}
+                          value={tagInputText}
+                          onChangeText={setTagInputText}
                           onSubmitEditing={async () => {
-                            await addTag(item.id, tagText);
-                            setTagText('');
-                            setEditingTagFor(null);
+                            await addTagToContact(contact.id, tagInputText);
+                            setTagInputText('');
+                            setContactBeingTagged(null);
                           }}
                           autoCapitalize="none"
                         />
                         <TouchableOpacity
                           onPress={async () => {
-                            await addTag(item.id, tagText);
-                            setTagText('');
-                            setEditingTagFor(null);
+                            await addTagToContact(contact.id, tagInputText);
+                            setTagInputText('');
+                            setContactBeingTagged(null);
                           }}
-                          style={styles.tagSave}
+                          style={styles.tagSaveButton}
                         >
-                          <Text style={styles.tagSaveText}>Add</Text>
+                          <Text style={styles.tagSaveButtonText}>Add</Text>
                         </TouchableOpacity>
                         <TouchableOpacity
                           onPress={() => {
-                            setTagText('');
-                            setEditingTagFor(null);
+                            setTagInputText('');
+                            setContactBeingTagged(null);
                           }}
                         >
-                          <Text style={styles.tagCancel}>Cancel</Text>
+                          <Text style={styles.tagCancelText}>Cancel</Text>
                         </TouchableOpacity>
                       </View>
                     ) : (
                       <TouchableOpacity
-                        onPress={() => setEditingTagFor(item.id)}
-                        style={styles.tagAdd}
+                        onPress={() => setContactBeingTagged(contact.id)}
+                        style={styles.tagAddButton}
                       >
-                        <Text style={styles.tagAddText}>+ Tag</Text>
+                        <Text style={styles.tagAddButtonText}>+ Tag</Text>
                       </TouchableOpacity>
                     )}
 
-                    {pin && (
+                    {/* Map Button */}
+                    {locationPin && (
                       <TouchableOpacity
-                        onPress={() => openPinInMaps(pin, item.name || 'Contact')}
+                        onPress={() => openLocationInNativeMaps(locationPin, contact.name || 'Contact')}
                         style={styles.mapButton}
                       >
                         <Text style={styles.mapButtonText}>Open in Maps</Text>
@@ -584,60 +889,66 @@ export default function App() {
                   </View>
                 </View>
 
-                <Text style={styles.badge}>{when ? fmtAbs(when) : ''}</Text>
+                {/* Timestamp Badge */}
+                <Text style={styles.timestampBadge}>
+                  {creationTime ? formatAbsoluteTime(creationTime) : ''}
+                </Text>
               </View>
             );
           }}
         />
       )}
 
+      {/* Import Mode Selection Modal */}
       <Modal transparent visible={showImportModal} animationType="fade">
         <View style={styles.modalBackdrop}>
           <View style={styles.modalCard}>
             <Text style={styles.modalTitle}>How should we start?</Text>
-            <Text style={styles.modalP}>
+            <Text style={styles.modalParagraph}>
               • <Text style={{ fontWeight: '600' }}>Import existing</Text>: show all your current contacts now.
             </Text>
-            <Text style={styles.modalP}>
+            <Text style={styles.modalParagraph}>
               • <Text style={{ fontWeight: '600' }}>Only new</Text>: only track contacts you add from now on.
             </Text>
             <View style={{ height: 12 }} />
+            
             <TouchableOpacity
-              style={styles.cta}
+              style={styles.callToAction}
               onPress={async () => {
-                await AsyncStorage.setItem(IMPORT_CHOICE_KEY, 'all');
-                setImportChoice('all');
+                await AsyncStorage.setItem(STORAGE_KEYS.IMPORT_CHOICE, 'all');
+                setImportMode('all');
                 setShowImportModal(false);
-                await fetchContacts(false);
+                await fetchContactsFromDevice(false);
               }}
             >
-              <Text style={styles.ctaText}>Import existing</Text>
+              <Text style={styles.callToActionText}>Import existing</Text>
             </TouchableOpacity>
+            
             <TouchableOpacity
-              style={[styles.cta, { backgroundColor: '#444' }]}
+              style={[styles.callToAction, { backgroundColor: '#444' }]}
               onPress={async () => {
                 const cutoffTime = Date.now();
                 console.log('User chose newOnly, setting cutoff:', cutoffTime);
-                await AsyncStorage.setItem(IMPORT_CHOICE_KEY, 'newOnly');
-                await AsyncStorage.setItem(READY_KEY, cutoffTime.toString());
+                await AsyncStorage.setItem(STORAGE_KEYS.IMPORT_CHOICE, 'newOnly');
+                await AsyncStorage.setItem(STORAGE_KEYS.READY, cutoffTime.toString());
                 
                 // Mark all existing contacts as seen with cutoff time
-                const fs = await loadJSON(FIRST_SEEN_KEY, {});
-                const result = await Contacts.getContactsAsync({ 
+                const firstSeenMap = await loadJSON(STORAGE_KEYS.FIRST_SEEN, {});
+                const allContacts = await Contacts.getContactsAsync({ 
                   fields: [Contacts.Fields.PhoneNumbers] 
                 });
                 
-                for (const c of result.data) {
-                  fs[c.id] = cutoffTime;
+                for (const contact of allContacts.data) {
+                  firstSeenMap[contact.id] = cutoffTime;
                 }
-                await saveJSON(FIRST_SEEN_KEY, fs);
+                await saveJSON(STORAGE_KEYS.FIRST_SEEN, firstSeenMap);
                 
-                setImportChoice('newOnly');
+                setImportMode('newOnly');
                 setShowImportModal(false);
-                await fetchContacts(false);
+                await fetchContactsFromDevice(false);
               }}
             >
-              <Text style={styles.ctaText}>Only new going forward</Text>
+              <Text style={styles.callToActionText}>Only new going forward</Text>
             </TouchableOpacity>
           </View>
         </View>
@@ -646,44 +957,212 @@ export default function App() {
   );
 }
 
-/* ---------- styles ---------- */
+// ============================================================================
+// STYLES
+// ============================================================================
+
 const styles = {
-  container: { flex: 1, backgroundColor: '#fff', paddingHorizontal: 16 },
-  center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
-  title: { fontSize: 28, fontWeight: '800', marginTop: 8, marginBottom: 10 },
-  search: { borderWidth: 1, borderColor: '#ddd', borderRadius: 10, paddingHorizontal: 12, paddingVertical: 8, marginBottom: 10 },
-  tabs: { flexDirection: 'row', gap: 8, marginBottom: 8 },
-  tab: { paddingVertical: 6, paddingHorizontal: 12, borderRadius: 8, backgroundColor: '#eee' },
-  tabActive: { backgroundColor: '#111' },
-  tabText: { fontWeight: '700', color: '#111', fontSize: 14 },
-  tabTextActive: { color: '#fff' },
-  loading: { alignItems: 'center', marginTop: 40 },
-  sep: { height: 1, backgroundColor: '#eee' },
-  empty: { textAlign: 'center', marginTop: 32, color: '#666', fontSize: 16 },
-  emptyHint: { textAlign: 'center', marginTop: 8, color: '#999', fontSize: 14 },
-  row: { flexDirection: 'row', paddingVertical: 10, gap: 10 },
-  name: { fontSize: 16, fontWeight: '700' },
-  sub: { color: '#666', marginTop: 2, fontSize: 14 },
-  badge: { alignSelf: 'flex-start', color: '#666', fontSize: 12 },
-  tagsRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 8, alignItems: 'center' },
-  tagChip: { backgroundColor: '#f0f0f0', borderRadius: 999, paddingHorizontal: 10, paddingVertical: 4 },
-  tagText: { fontWeight: '600', color: '#333', fontSize: 12 },
-  tagAdd: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 999, backgroundColor: '#e8f0ff' },
-  tagAddText: { fontWeight: '700', color: '#3366ff', fontSize: 12 },
-  mapButton: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 999, backgroundColor: '#e8f0ff' },
-  mapButtonText: { fontWeight: '700', color: '#3366ff', fontSize: 12 },
-  tagEditor: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  tagInput: { borderWidth: 1, borderColor: '#ddd', borderRadius: 8, paddingHorizontal: 10, paddingVertical: 6, minWidth: 120, fontSize: 14 },
-  tagSave: { backgroundColor: '#111', borderRadius: 8, paddingHorizontal: 12, paddingVertical: 6 },
-  tagSaveText: { color: '#fff', fontWeight: '700', fontSize: 12 },
-  tagCancel: { color: '#666', fontSize: 12 },
-  mapContainer: { flex: 1, borderRadius: 12, overflow: 'hidden', marginTop: 8 },
-  map: { flex: 1 },
-  emptyMap: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#f9f9f9' },
-  modalBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.35)', alignItems: 'center', justifyContent: 'center' },
-  modalCard: { width: '86%', backgroundColor: '#fff', borderRadius: 16, padding: 18 },
-  modalTitle: { fontSize: 18, fontWeight: '800', marginBottom: 8 },
-  modalP: { color: '#333', marginTop: 4, fontSize: 14 },
-  cta: { backgroundColor: '#111', paddingVertical: 10, borderRadius: 10, marginTop: 10, alignItems: 'center' },
-  ctaText: { color: '#fff', fontWeight: '800', fontSize: 16 },
+  container: { 
+    flex: 1, 
+    backgroundColor: '#fff', 
+    paddingHorizontal: 16 
+  },
+  center: { 
+    flex: 1, 
+    alignItems: 'center', 
+    justifyContent: 'center' 
+  },
+  title: { 
+    fontSize: 28, 
+    fontWeight: '800', 
+    marginTop: 8, 
+    marginBottom: 10 
+  },
+  searchInput: { 
+    borderWidth: 1, 
+    borderColor: '#ddd', 
+    borderRadius: 10, 
+    paddingHorizontal: 12, 
+    paddingVertical: 8, 
+    marginBottom: 10 
+  },
+  tabBar: { 
+    flexDirection: 'row', 
+    gap: 8, 
+    marginBottom: 8 
+  },
+  tab: { 
+    paddingVertical: 6, 
+    paddingHorizontal: 12, 
+    borderRadius: 8, 
+    backgroundColor: '#eee' 
+  },
+  tabActive: { 
+    backgroundColor: '#111' 
+  },
+  tabText: { 
+    fontWeight: '700', 
+    color: '#111', 
+    fontSize: 14 
+  },
+  tabTextActive: { 
+    color: '#fff' 
+  },
+  loadingContainer: { 
+    alignItems: 'center', 
+    marginTop: 40 
+  },
+  separator: { 
+    height: 1, 
+    backgroundColor: '#eee' 
+  },
+  emptyText: { 
+    textAlign: 'center', 
+    marginTop: 32, 
+    color: '#666', 
+    fontSize: 16 
+  },
+  emptyHint: { 
+    textAlign: 'center', 
+    marginTop: 8, 
+    color: '#999', 
+    fontSize: 14 
+  },
+  contactRow: { 
+    flexDirection: 'row', 
+    paddingVertical: 10, 
+    gap: 10 
+  },
+  contactName: { 
+    fontSize: 16, 
+    fontWeight: '700' 
+  },
+  contactSubtext: { 
+    color: '#666', 
+    marginTop: 2, 
+    fontSize: 14 
+  },
+  timestampBadge: { 
+    alignSelf: 'flex-start', 
+    color: '#666', 
+    fontSize: 12 
+  },
+  tagsRow: { 
+    flexDirection: 'row', 
+    flexWrap: 'wrap', 
+    gap: 8, 
+    marginTop: 8, 
+    alignItems: 'center' 
+  },
+  tagChip: { 
+    backgroundColor: '#f0f0f0', 
+    borderRadius: 999, 
+    paddingHorizontal: 10, 
+    paddingVertical: 4 
+  },
+  tagText: { 
+    fontWeight: '600', 
+    color: '#333', 
+    fontSize: 12 
+  },
+  tagAddButton: { 
+    paddingHorizontal: 10, 
+    paddingVertical: 4, 
+    borderRadius: 999, 
+    backgroundColor: '#e8f0ff' 
+  },
+  tagAddButtonText: { 
+    fontWeight: '700', 
+    color: '#3366ff', 
+    fontSize: 12 
+  },
+  mapButton: { 
+    paddingHorizontal: 10, 
+    paddingVertical: 4, 
+    borderRadius: 999, 
+    backgroundColor: '#e8f0ff' 
+  },
+  mapButtonText: { 
+    fontWeight: '700', 
+    color: '#3366ff', 
+    fontSize: 12 
+  },
+  tagEditor: { 
+    flexDirection: 'row', 
+    alignItems: 'center', 
+    gap: 8 
+  },
+  tagInput: { 
+    borderWidth: 1, 
+    borderColor: '#ddd', 
+    borderRadius: 8, 
+    paddingHorizontal: 10, 
+    paddingVertical: 6, 
+    minWidth: 120, 
+    fontSize: 14 
+  },
+  tagSaveButton: { 
+    backgroundColor: '#111', 
+    borderRadius: 8, 
+    paddingHorizontal: 12, 
+    paddingVertical: 6 
+  },
+  tagSaveButtonText: { 
+    color: '#fff', 
+    fontWeight: '700', 
+    fontSize: 12 
+  },
+  tagCancelText: { 
+    color: '#666', 
+    fontSize: 12 
+  },
+  mapContainer: { 
+    flex: 1, 
+    borderRadius: 12, 
+    overflow: 'hidden', 
+    marginTop: 8 
+  },
+  map: { 
+    flex: 1 
+  },
+  emptyMapState: { 
+    flex: 1, 
+    alignItems: 'center', 
+    justifyContent: 'center', 
+    backgroundColor: '#f9f9f9' 
+  },
+  modalBackdrop: { 
+    flex: 1, 
+    backgroundColor: 'rgba(0,0,0,0.35)', 
+    alignItems: 'center', 
+    justifyContent: 'center' 
+  },
+  modalCard: { 
+    width: '86%', 
+    backgroundColor: '#fff', 
+    borderRadius: 16, 
+    padding: 18 
+  },
+  modalTitle: { 
+    fontSize: 18, 
+    fontWeight: '800', 
+    marginBottom: 8 
+  },
+  modalParagraph: { 
+    color: '#333', 
+    marginTop: 4, 
+    fontSize: 14 
+  },
+  callToAction: { 
+    backgroundColor: '#111', 
+    paddingVertical: 10, 
+    borderRadius: 10, 
+    marginTop: 10, 
+    alignItems: 'center' 
+  },
+  callToActionText: { 
+    color: '#fff', 
+    fontWeight: '800', 
+    fontSize: 16 
+  },
 };
