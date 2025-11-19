@@ -1,3 +1,15 @@
+/**
+ * ContactsCreationDateModule.swift
+ * NeverForget
+ *
+ * Purpose: Native iOS module that retrieves contact creation and modification dates
+ *          from the deprecated AddressBook framework.
+ *
+ * Author: Bryce Christian
+ * Course: SENG 564
+ * Date: November 16, 2025
+ **/
+
 import Expo
 import React
 import ReactAppDependencyProvider
